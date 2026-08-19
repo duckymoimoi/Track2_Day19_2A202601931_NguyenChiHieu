@@ -15,8 +15,10 @@
 
 # %%
 import _setup  # noqa: F401
+import socket
 import statistics
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -30,31 +32,38 @@ import httpx
 
 # %%
 ROOT = Path(_setup.__file__).resolve().parent.parent
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    SERVER_PORT = sock.getsockname()[1]
 proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
+    [sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(SERVER_PORT),
+     "--log-level", "warning"],
     cwd=str(ROOT),
 )
 
 # Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
-URL = "http://localhost:8000"
-for _ in range(60):
+URL = f"http://localhost:{SERVER_PORT}"
+client = httpx.Client(base_url=URL, timeout=10.0)
+for _ in range(300):
     try:
-        r = httpx.get(f"{URL}/healthz", timeout=2.0)
+        r = client.get("/healthz")
         if r.status_code == 200 and r.json().get("ready"):
             break
     except httpx.HTTPError:
         pass
     time.sleep(1)
 else:
-    raise RuntimeError("API didn't become ready within 60s")
+    proc.terminate()
+    proc.wait(timeout=10)
+    raise RuntimeError("API didn't become ready within 300s")
 
-print(httpx.get(f"{URL}/healthz").json())
+print(client.get("/healthz").json())
 
 # %% [markdown]
 # ## 2. Single query — kiểm tra response shape
 
 # %%
-r = httpx.get(f"{URL}/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
+r = client.get("/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
 r.raise_for_status()
 body = r.json()
 print(f"latency_ms: {body['latency_ms']:.1f}")
@@ -63,7 +72,7 @@ for h in body["hits"][:3]:
     print(f"  {h['doc_id']:>14}  score={h['score']:.4f}  {h['title']}")
 
 # %% [markdown]
-# ## 3. TODO — Latency benchmark (100 queries × 3 modes)
+# ## 3. Latency benchmark (100 queries × 3 modes)
 #
 # Dùng 50 golden queries × 2 reps = 100 calls/mode. Ghi nhận latency từ
 # `body["latency_ms"]` (server-side, đã trừ network) HOẶC từ wall-clock httpx
@@ -91,7 +100,7 @@ def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
     for _ in range(reps):
         for q in golden:
             t0 = time.perf_counter()
-            r = httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
+            r = client.get("/search", params={"q": q["query"], "mode": mode})
             wall_latencies.append((time.perf_counter() - t0) * 1000)
             server_latencies.append(r.json()["latency_ms"])
     return {
@@ -101,6 +110,11 @@ def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
         "p99_wall":   percentile(wall_latencies, 0.99),
     }
 
+
+for mode in ("keyword", "semantic", "hybrid"):
+    for q in golden[:10]:
+        warm = client.get("/search", params={"q": q["query"], "mode": mode})
+        warm.raise_for_status()
 
 print(f"  {'mode':10}  {'P50':>7}  {'P95':>7}  {'P99':>7}  {'P99(wall)':>9}")
 results = {}
@@ -129,6 +143,7 @@ else:
 # %%
 proc.terminate()
 proc.wait(timeout=5)
+client.close()
 print("API server stopped")
 
 # %% [markdown]

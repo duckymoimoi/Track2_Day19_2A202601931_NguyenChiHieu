@@ -9,11 +9,13 @@ by Vespa, Elasticsearch, and the hybrid RAG production stacks in the deck §3.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 from rank_bm25 import BM25Okapi
@@ -52,6 +54,7 @@ class Searcher:
         self.bm25: BM25Okapi | None = None
         self.client: QdrantClient | None = None
         self.embedder: Embedder | None = None
+        self.vectors: np.ndarray | None = None
 
     @property
     def size(self) -> int:
@@ -72,7 +75,7 @@ class Searcher:
         s = cls()
         s._load_docs(corpus_path)
         s._build_bm25()
-        s._build_vector_index()
+        s._build_vector_index(Path(corpus_path))
         return s
 
     # ── ingestion ───────────────────────────────────────────────────────
@@ -90,7 +93,7 @@ class Searcher:
         tokenized = [self._tokenize(d["title"] + " " + d["text"]) for d in self.docs]
         self.bm25 = BM25Okapi(tokenized)
 
-    def _build_vector_index(self) -> None:
+    def _build_vector_index(self, corpus_path: Path) -> None:
         self.embedder = Embedder()
 
         mode = os.getenv("QDRANT_MODE", "memory")
@@ -111,19 +114,45 @@ class Searcher:
             vectors_config=VectorParams(size=self.embedder.dim, distance=Distance.COSINE),
         )
 
-        # Embed in batches of 64 — fastembed is CPU-bound and that batch size is sweet spot.
-        BATCH = 64
+        # Cache the expensive corpus embedding by corpus content + backend.
+        # This keeps notebook/API restarts reproducible without touching the
+        # source corpus or changing retrieval results.
+        digest = hashlib.sha256(corpus_path.read_bytes()).hexdigest()[:16]
+        cache_path = corpus_path.parent / (
+            f".{corpus_path.stem}.{self.embedder.backend}.{digest}.vectors.npy"
+        )
+        if cache_path.exists():
+            matrix = np.load(cache_path, allow_pickle=False)
+            if matrix.shape != (len(self.docs), self.embedder.dim):
+                matrix = None
+        else:
+            matrix = None
+
+        if matrix is None:
+            # Embed in batches of 64 — CPU-bound and a good memory/throughput tradeoff.
+            rows: list[np.ndarray] = []
+            BATCH = 64
+            for start in range(0, len(self.docs), BATCH):
+                batch = self.docs[start:start + BATCH]
+                texts = [d["title"] + " " + d["text"] for d in batch]
+                rows.extend(np.asarray(v, dtype=np.float32) for v in self.embedder.embed(texts))
+            matrix = np.asarray(rows, dtype=np.float32)
+            if matrix.shape != (len(self.docs), self.embedder.dim):
+                raise ValueError(
+                    f"embedding matrix has shape {matrix.shape}, expected "
+                    f"({len(self.docs)}, {self.embedder.dim})"
+                )
+            np.save(cache_path, matrix)
+
+        self.vectors = np.asarray(matrix, dtype=np.float32)
+
         points: list[PointStruct] = []
-        for start in range(0, len(self.docs), BATCH):
-            batch = self.docs[start:start + BATCH]
-            texts = [d["title"] + " " + d["text"] for d in batch]
-            vectors = list(self.embedder.embed(texts))
-            for i, (d, v) in enumerate(zip(batch, vectors)):
-                points.append(PointStruct(
-                    id=start + i,
-                    vector=v.tolist(),
-                    payload={"doc_id": d["doc_id"], "title": d["title"], "text": d["text"]},
-                ))
+        for i, (d, vector) in enumerate(zip(self.docs, matrix)):
+            points.append(PointStruct(
+                id=i,
+                vector=vector.tolist(),
+                payload={"doc_id": d["doc_id"], "title": d["title"], "text": d["text"]},
+            ))
         self.client.upsert(collection_name=COLLECTION, points=points)
 
     # ── retrieval ───────────────────────────────────────────────────────
@@ -161,21 +190,20 @@ class Searcher:
         ]
 
     def _search_semantic(self, query: str, top_k: int) -> list[SearchHit]:
-        assert self.client is not None and self.embedder is not None
-        q_vec = next(self.embedder.embed([query])).tolist()
-        result = self.client.query_points(
-            collection_name=COLLECTION,
-            query=q_vec,
-            limit=top_k,
-        )
+        assert self.embedder is not None and self.vectors is not None
+        q_vec = self.embedder.embed_one(query)
+        scores = self.vectors @ q_vec
+        k = min(top_k, len(scores))
+        candidates = np.argpartition(scores, -k)[-k:]
+        ranked = candidates[np.argsort(scores[candidates])[::-1]]
         return [
             SearchHit(
-                doc_id=p.payload["doc_id"],
-                title=p.payload["title"],
-                text=p.payload["text"],
-                score=float(p.score),
+                doc_id=self.docs[i]["doc_id"],
+                title=self.docs[i]["title"],
+                text=self.docs[i]["text"],
+                score=float(scores[i]),
             )
-            for p in result.points
+            for i in ranked
         ]
 
     def _search_hybrid(self, query: str, top_k: int, rrf_k: int) -> list[SearchHit]:

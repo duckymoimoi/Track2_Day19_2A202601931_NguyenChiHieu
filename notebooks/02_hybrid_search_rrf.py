@@ -22,7 +22,7 @@ import json
 import statistics
 from pathlib import Path
 
-from fastembed import TextEmbedding
+from app.embeddings import Embedder
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from rank_bm25 import BM25Okapi
@@ -40,11 +40,11 @@ tokenized = [(d["title"] + " " + d["text"]).lower().split() for d in docs]
 bm25 = BM25Okapi(tokenized)
 
 # Vector
-embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+embedder = Embedder()
 client = QdrantClient(":memory:")
 client.create_collection(
     collection_name="lab19",
-    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+    vectors_config=VectorParams(size=embedder.dim, distance=Distance.COSINE),
 )
 BATCH = 64
 points = []
@@ -66,6 +66,7 @@ print(f"BM25 + vector indices ready ({len(docs)} docs)")
 # %%
 TOP_K = 10
 RRF_K = 60   # standard default — see slide §3
+_semantic_rank_cache: dict[str, list[str]] = {}
 
 
 def search_keyword(query: str, top_k: int = TOP_K) -> list[str]:
@@ -75,13 +76,15 @@ def search_keyword(query: str, top_k: int = TOP_K) -> list[str]:
 
 
 def search_semantic(query: str, top_k: int = TOP_K) -> list[str]:
-    q_vec = next(embedder.embed([query])).tolist()
-    res = client.query_points(collection_name="lab19", query=q_vec, limit=top_k)
-    return [p.payload["doc_id"] for p in res.points]
+    if query not in _semantic_rank_cache:
+        q_vec = next(embedder.embed([query])).tolist()
+        res = client.query_points(collection_name="lab19", query=q_vec, limit=50)
+        _semantic_rank_cache[query] = [p.payload["doc_id"] for p in res.points]
+    return _semantic_rank_cache[query][:top_k]
 
 
 # %% [markdown]
-# ## 3. TODO — implement Reciprocal Rank Fusion
+# ## 3. Implement Reciprocal Rank Fusion
 #
 # Công thức (deck §3):
 #
@@ -100,9 +103,7 @@ def search_hybrid(query: str, top_k: int = TOP_K, rrf_k: int = RRF_K) -> list[st
     kw_ids = search_keyword(query, depth)
     sem_ids = search_semantic(query, depth)
 
-    # TODO: implement RRF fusion below.
-    # Hint: dict[doc_id, float] cộng 1/(rrf_k + rank) từ mỗi retriever.
-    # rank starts at 1, not 0.
+    # Add 1/(rrf_k + rank) from each retriever. Rank is 1-based.
     rrf: dict[str, float] = {}
     for rank, doc_id in enumerate(kw_ids, start=1):
         rrf[doc_id] = rrf.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)

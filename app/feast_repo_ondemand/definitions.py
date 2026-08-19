@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 from feast import Entity, FeatureView, Field, FileSource, RequestSource
 from feast.types import Float64, Int64
@@ -61,7 +62,7 @@ txn_request = RequestSource(
     ],
     mode="python",
 )
-def amount_vs_avg(inputs: dict) -> dict:
+def amount_vs_avg(inputs: dict[str, Any]) -> dict[str, Any]:
     """Ratio of this transaction to the user's own recent baseline.
 
     Absolute amount is a weak fraud signal (a large purchase is normal for a

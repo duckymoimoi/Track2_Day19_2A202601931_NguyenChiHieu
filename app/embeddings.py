@@ -20,6 +20,7 @@ opt-in via the environment.
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
@@ -77,7 +78,8 @@ class Embedder:
         p = self.spec.provider
         if p == "fastembed":
             from fastembed import TextEmbedding
-            self._impl = TextEmbedding(model_name=self.spec.model)
+            threads = int(os.getenv("FASTEMBED_THREADS", "8"))
+            self._impl = TextEmbedding(model_name=self.spec.model, threads=threads)
         elif p == "sentence-transformers":
             try:
                 from sentence_transformers import SentenceTransformer
@@ -113,6 +115,14 @@ class Embedder:
             resp = impl.embeddings.create(model=self.spec.model, input=texts)
             for item in resp.data:
                 yield np.asarray(item.embedding, dtype=np.float32)
+
+    @lru_cache(maxsize=2048)
+    def embed_one(self, text: str) -> np.ndarray:
+        """Embed one query and reuse the result for repeated API requests."""
+        vector = next(self.embed([text]))
+        vector = np.asarray(vector, dtype=np.float32)
+        vector.setflags(write=False)
+        return vector
 
 
 def describe() -> str:

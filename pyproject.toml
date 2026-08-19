@@ -33,8 +33,9 @@ docker = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["app", "scripts"]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
+norecursedirs = [".git", ".venv", ".pytest_cache"]
 
 [tool.ruff]
 line-length = 100

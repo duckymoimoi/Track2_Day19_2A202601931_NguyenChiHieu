@@ -16,7 +16,10 @@
 
 # %%
 import _setup  # noqa: F401
+import site
+import shutil
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +29,14 @@ REPO_ROOT = Path(_setup.__file__).resolve().parent.parent
 FEAST_DIR = REPO_ROOT / "app" / "feast_repo"
 FEAST_DATA = FEAST_DIR / "data"
 FEAST_DATA.mkdir(exist_ok=True)
+_feast_candidates = [
+    shutil.which("feast"),
+    Path(sys.executable).parent / "Scripts" / "feast.exe",
+    Path(site.USER_BASE) / f"Python{sys.version_info.major}{sys.version_info.minor}" / "Scripts" / "feast.exe",
+]
+FEAST_CLI = next((str(path) for path in _feast_candidates if path and Path(path).exists()), None)
+if FEAST_CLI is None:
+    raise FileNotFoundError("Không tìm thấy Feast CLI trong PATH hoặc Python Scripts directory")
 
 # %% [markdown]
 # ## 1. Sinh dữ liệu offline (Parquet) cho 3 feature views
@@ -83,8 +94,13 @@ for p in sorted(FEAST_DATA.glob("*.parquet")):
 # Chạy `feast apply` để Feast đọc file definition và ghi vào `registry.db`.
 
 # %%
+# Registry and online-store files contain absolute paths. Recreate them so a
+# notebook previously run on Linux/WSL also executes cleanly on Windows.
+for generated in (FEAST_DIR / "registry.db", FEAST_DIR / "online_store.db"):
+    generated.unlink(missing_ok=True)
+
 res = subprocess.run(
-    ["feast", "apply"],
+    [FEAST_CLI, "apply"],
     cwd=str(FEAST_DIR),
     capture_output=True, text=True, check=False,
 )
@@ -95,6 +111,16 @@ if res.stderr:
     print(res.stderr)
 assert res.returncode == 0, f"feast apply failed: {res.stderr}"
 
+from feast import FeatureStore
+registered_views = FeatureStore(repo_path=str(FEAST_DIR)).list_all_feature_views()
+registered_names = sorted(view.name for view in registered_views)
+print("Registered feature views:", registered_names)
+assert registered_names == [
+    "item_popularity_features",
+    "query_velocity_features",
+    "user_profile_features",
+], registered_names
+
 # %% [markdown]
 # ## 3. `feast materialize-incremental` — load offline → online
 #
@@ -104,7 +130,7 @@ assert res.returncode == 0, f"feast apply failed: {res.stderr}"
 # %%
 end_dt = NOW.strftime("%Y-%m-%dT%H:%M:%S")
 res = subprocess.run(
-    ["feast", "materialize-incremental", end_dt],
+    [FEAST_CLI, "materialize-incremental", end_dt],
     cwd=str(FEAST_DIR),
     capture_output=True, text=True, check=False,
 )
@@ -147,10 +173,16 @@ print(f"Single lookup: {single_latency_ms:.2f}ms")
 print({k: v[0] for k, v in features.items()})
 
 # %% [markdown]
-# ## 5. TODO — Batch latency benchmark (100 lookups, P99)
+# ## 5. Batch latency benchmark (100 lookups, P99)
 
 # %%
 latencies: list[float] = []
+# Discard SQLite/Feast one-time initialization before measuring the 100 calls.
+for _ in range(10):
+    fs.get_online_features(
+        features=REQUEST_FEATURES,
+        entity_rows=[{"user_id": "u_001"}],
+    ).to_dict()
 for i in range(100):
     user_id = f"u_{i:03d}"
     t0 = time.perf_counter()
@@ -185,7 +217,13 @@ else:
 import pandas as pd
 entity_df = pd.DataFrame({
     "user_id": ["u_001", "u_002", "u_003"],
-    "event_timestamp": [NOW - timedelta(hours=2), NOW - timedelta(hours=1), NOW],
+    # Each timestamp is after that user's first profile event. Feast can then
+    # return all three rows instead of dropping a row with no historical value.
+    "event_timestamp": [
+        NOW - timedelta(minutes=30),
+        NOW - timedelta(minutes=90),
+        NOW - timedelta(minutes=150),
+    ],
 })
 
 historical = fs.get_historical_features(
